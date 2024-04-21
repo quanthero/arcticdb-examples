@@ -1,50 +1,72 @@
-import arcticdb as adb
+import logging
 from datetime import datetime, timedelta
+import pytz
 from cryptofeed import FeedHandler
-from cryptofeed.defines import TICKER
-from cryptofeed.exchanges import COINBASE
+from cryptofeed.defines import TRADES
+from cryptofeed.exchanges import Coinbase
+import pandas as pd
+from arctic import Arctic
 
-# 连接到ArcticDB
-ac = adb.Arctic('s3://your_bucket_name/arcticdb')
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# 创建两个库
-recent_lib = ac.initialize_library('recent_tickers')
-history_lib = ac.initialize_library('history_tickers', lib_type=adb.CHUNK_STORE, chunk_size='W')
+# ArcticDB connection and configuration
+AC_ENDPOINT = 's3://***'
+AC_ACCESS_KEY = 'your_access_key'
+AC_SECRET_KEY = 'your_secret_key'
+ac = Arctic(f'{AC_ENDPOINT}?access={AC_ACCESS_KEY}&secret={AC_SECRET_KEY}')
 
-# 设置压缩选项
-history_lib.set_compression(adb.CompressionsType.LZMA)
+LIBRARY_NAME = 'tick_data'
+ARCHIVE_LIBRARY_NAME = 'tick_data_archive'
 
-# 定义一周前的日期
-one_week_ago = datetime.now() - timedelta(days=7)
+# Check and create libraries if they do not exist
+for lib_name in [LIBRARY_NAME, ARCHIVE_LIBRARY_NAME]:
+    if lib_name not in ac.list_libraries():
+        ac.create_library(lib_name)
 
-# 处理Ticker数据的回调函数
-async def ticker_handler(feed, pair, data, timestamp):
-    symbol = pair.split('-')[0]
-    ticker = {
-        'feed': feed,
-        'pair': pair,
-        'bid': data.bid,
-        'ask': data.ask,
-        'timestamp': timestamp
-    }
-    
-    # 写入最近一周库
-    recent_lib.write(symbol, ticker, metadata={'asof': timestamp})
-    
-    # 移动历史数据到压缩库
-    move_to_history(symbol)
-        
-def move_to_history(symbol):
-    recent_data = recent_lib.read(symbol).data
-    history_data = recent_data[recent_data.index < one_week_ago]
-    if not history_data.empty:
-        history_lib.write(symbol, history_data)
-    recent_lib.write(symbol, recent_data[recent_data.index >= one_week_ago])
+library = ac[LIBRARY_NAME]
+archive_library = ac[ARCHIVE_LIBRARY_NAME]
 
-# 订阅Coinbase的BTC-USD Ticker数据
-fh = FeedHandler()
-fh.subscribe(COINBASE, TICKER, ['BTC-USD'])
-fh.add_feed(TICKER, ticker_handler)
+def archive_old_data():
+    """Archives data older than one week."""
+    try:
+        one_week_ago = datetime.now(pytz.utc) - timedelta(weeks=1)
+        for symbol in library.list_symbols():
+            data = library.read(symbol)
+            old_data = data[data['timestamp'] < one_week_ago.isoformat()]
+            if not old_data.empty:
+                archive_library.append(symbol, old_data)  # Append to archive
+                # Now remove old data from main library
+                # Assume `delete` is a hypothetical method to remove data. This depends on Arctic's capabilities.
+                library.delete(symbol, old_data.index)
+                logging.info(f"Archived data for {symbol} older than one week.")
+    except Exception as e:
+        logging.error("Failed to archive old data: %s", e)
 
-# 启动数据获取
-fh.run()
+async def arctic_callback(trade, receipt_timestamp):
+    try:
+        trade.timestamp = trade.timestamp.astimezone(pytz.timezone('Asia/Shanghai'))
+        iso_timestamp = trade.timestamp.isoformat()
+        data = {
+            'symbol': [trade.symbol],
+            'timestamp': [iso_timestamp],
+            'side': [trade.side],
+            'amount': [float(trade.amount)],
+            'price': [float(trade.price)]
+        }
+        df = pd.DataFrame(data)
+        library.append(trade.symbol, df)
+        logging.info(f"Appended data for {trade.symbol} at {iso_timestamp}")
+    except Exception as e:
+        logging.error("Error processing trade data: %s", e)
+
+def main():
+    f = FeedHandler()
+    f.add_feed(Coinbase(channels=[TRADES], symbols=['BTC-USD'], callbacks={TRADES: arctic_callback}))
+    f.run()
+
+    # Periodically archive data
+    archive_old_data()
+
+if __name__ == '__main__':
+    main()
